@@ -27,7 +27,7 @@ from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
-
+import fmoe.gates as gates
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -45,7 +45,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 """
 
 class DropPath(MegatronModule):
-    """Drop paths (Stochastic Depth) per sample 
+    """Drop paths (Stochastic Depth) per sample
     (when applied in main path of residual blocks).
     """
 
@@ -149,7 +149,7 @@ class SwitchMLP(MegatronModule):
         output_total = torch.empty_like(hidden_states)
         output_bias_total = torch.empty_like(hidden_states)
         #TODO (rprenger) This does each expert in serial, but it could be parallelized
-        
+
         for expert_num, expert in enumerate(self.experts):
             local_indices = (max_ind == expert_num).nonzero()
             hidden = hidden_states[local_indices,:]
@@ -531,7 +531,8 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 drop_path_rate=0.):
+                 drop_path_rate=0.,
+                 gate=gates.NaiveGate, gate_bias=True):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -543,6 +544,17 @@ class ParallelTransformerLayer(MegatronModule):
 
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
+
+        # instantiate self.gate
+        world_size = args.data_parallel_size
+        if issubclass(gate, gates.NaiveGate):
+            self.gate = gate(args.hidden_size, args.fmoe_num_experts, world_size, args.top_k, gate_bias=gate_bias)
+        else:
+            self.gate = gate(args.hidden_size, args.fmoe_num_experts, world_size, args.top_k)
+
+        # TODO(wxp): this func is originally called in FMoE.mark_parallel_comm
+        from fmoe.layers import mark_module_parallel_comm
+        mark_module_parallel_comm(self.gate, "gate")
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
@@ -602,6 +614,13 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
+
+        # calculate gating
+        original_shape = layernorm_output.shape
+        layernorm_output = layernorm_output.reshape(-1, get_args().hidden_size)
+        gate_top_k_idx, gate_score = self.gate(layernorm_output)
+        layernorm_output = layernorm_output.reshape(original_shape)
+
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(
@@ -665,7 +684,7 @@ class ParallelTransformerLayer(MegatronModule):
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
 
         # MLP.
-        mlp_output, mlp_bias = self.mlp(layernorm_output)
+        mlp_output, mlp_bias = self.mlp(layernorm_output, gate_top_k_idx, gate_score)
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -721,9 +740,10 @@ class ParallelTransformer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 post_layer_norm=True, 
+                 post_layer_norm=True,
                  pre_process=True, post_process=True,
-                 drop_path_rate=0.0):
+                 drop_path_rate=0.0,
+                 gate=None):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -760,7 +780,8 @@ class ParallelTransformer(MegatronModule):
                 layer_number,
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type,
-                drop_path_rate=self.drop_path_rates[layer_number - 1])
+                drop_path_rate=self.drop_path_rates[layer_number - 1],
+                gate=gate)
         if args.virtual_pipeline_model_parallel_size is not None:
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
@@ -898,7 +919,7 @@ class ParallelTransformer(MegatronModule):
         #   However, we don't explicitly check mbs == 1 here because
         #   make_viewless_tensor() has negligible overhead when its input
         #   is already viewless.
-        # 
+        #
         # - For the 'else' case above, calling make_viewless_tensor() here is
         #   likely redundant, since p2p_communication.py (likely originator)
         #   already creates viewless tensors. That said, make_viewless_tensor()

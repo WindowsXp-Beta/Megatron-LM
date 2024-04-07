@@ -20,6 +20,9 @@ import os
 
 import torch
 
+# FastMoE
+from fmoe.megatron import add_fmoe_args as _add_fmoe_args
+
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
     """Parse all arguments."""
@@ -42,6 +45,9 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
+
+    # FastMoE arguments.
+    parser = _add_fmoe_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -316,6 +322,12 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    # if fmoe_num_experts is not specified,
+    # we are using lower version of megatron,
+    # copy num_experts to fmoe_num_experts
+    if not hasattr(args, 'fmoe_num_experts'):
+        args.fmoe_num_experts = args.num_experts
+
     _print_args(args)
     return args
 
@@ -350,7 +362,7 @@ def _add_inference_args(parser):
 
     return parser
 
-    
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -744,7 +756,7 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--local_rank', type=int, default=None,
+    group.add_argument('--local-rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
@@ -947,14 +959,14 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-    
+
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
- 
+
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,
                        help='iterations per epoch')

@@ -181,7 +181,7 @@ class Embedding(MegatronModule):
         else:
             self.tokentype_embeddings = None
 
-        self.fp32_residual_connection = args.fp32_residual_connection 
+        self.fp32_residual_connection = args.fp32_residual_connection
         self.sequence_parallel = args.sequence_parallel
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
@@ -353,6 +353,26 @@ class TransformerLanguageModel(MegatronModule):
                                        self.num_tokentypes)
             self._embedding_key = 'embedding'
 
+        # gating of MoE, we bring the gating calculation ahead so that we can calculate scheduling earlier
+
+        if not args.balance_strategy or args.balance_strategy == "naive":
+            from fmoe.gates import NaiveGate
+            gate = NaiveGate
+        elif args.balance_strategy == "noisy":
+            from fmoe.gates import NoisyGate
+            gate = NoisyGate
+        elif args.balance_strategy == "gshard":
+            from fmoe.gates import GShardGate
+            gate = GShardGate
+        elif args.balance_strategy == "switch":
+            from fmoe.gates import SwitchGate
+            gate = SwitchGate
+        elif args.balance_strategy == "swipe":
+            from fmoe.gates import SwipeGate
+            gate = SwipeGate
+        elif gate is None:
+            assert False, "Undefined balance strategy {}" % (args.balance_strategy)
+
         # Transformer.
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
@@ -362,7 +382,8 @@ class TransformerLanguageModel(MegatronModule):
                 output_layer_init_method,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
-                post_process=self.post_process
+                post_process=self.post_process,
+                gate=gate
             )
             self._encoder_key = 'encoder'
         else:
@@ -430,6 +451,7 @@ class TransformerLanguageModel(MegatronModule):
         else:
             encoder_input = None
 
+
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
@@ -441,6 +463,7 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder_hidden_state
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
+
 
         if self.post_process:
             if self.add_pooler:
