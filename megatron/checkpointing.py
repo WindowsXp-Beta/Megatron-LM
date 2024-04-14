@@ -124,6 +124,10 @@ def read_metadata(tracker_filename):
                 sys.exit()
     assert iteration > 0 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
+    
+    args = get_args()
+    if args.fmoefy:
+        return iteration, release
 
     # Get the max iteration retrieved across the ranks.
     iters_cuda = torch.cuda.LongTensor([iteration])
@@ -134,6 +138,7 @@ def read_metadata(tracker_filename):
     # If not, print a warning and chose the maximum
     # iteration across all ranks.
     if iteration != max_iter:
+        rank = torch.distributed.get_rank()
         print('WARNING: on rank {} found iteration {} in the '
               'metadata while max iteration across the ranks '
               'is {}, replacing it with max iteration.'.format(
@@ -399,7 +404,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
-        except KeyError:
+        except KeyError as e:
+            print(e)
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '

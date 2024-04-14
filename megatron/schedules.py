@@ -24,7 +24,10 @@ from megatron import get_timers
 from megatron import mpu
 from megatron import p2p_communication
 from megatron.utils import unwrap_model
-from megatron.model import DistributedDataParallel as LocalDDP
+
+# FastMoE
+# from megatron.model import DistributedDataParallel as LocalDDP
+from fmoe.megatron import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model import ModelType
 
@@ -66,7 +69,7 @@ def deallocate_output_tensor(out):
         dtype = out.dtype,
     )
         
-def custom_backward(output, grad_output):
+def custom_backward(output, grad_output, bal_loss):
     '''Directly call C++ autograd engine.
 
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
@@ -89,11 +92,16 @@ def custom_backward(output, grad_output):
             output,
             memory_format = torch.preserve_format,
         )
+        tensors = (output,)
+        grad_tensors = (grad_output,)
+    else:
+        tensors = (output, bal_loss)
+        grad_tensors = (grad_output, None)
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
     Variable._execution_engine.run_backward(
-        tensors = (output,),
-        grad_tensors = (grad_output,),
+        tensors = tensors,
+        grad_tensors = grad_tensors,
         keep_graph = False,
         create_graph = False,
         inputs = tuple(),
@@ -127,7 +135,8 @@ def forward_step(forward_step_func,
         unwrap_output_tensor = True
 
     unwrapped_model.set_input_tensor(input_tensor)
-    output_tensor, loss_func = forward_step_func(data_iterator, model)
+    output_tensor, loss_func, bal_loss = forward_step_func(data_iterator, model)
+    bal_loss = bal_loss / get_num_microbatches()
     if mpu.is_pipeline_last_stage():
         if not collect_non_loss_data:
             output_tensor = loss_func(output_tensor)
@@ -145,13 +154,14 @@ def forward_step(forward_step_func,
     # downstream as well.
     if mpu.is_pipeline_stage_after_split() and \
             args.model_type == ModelType.encoder_and_decoder:
+        assert False, f"encoder-decoder model is not supported by FastMoE "
         return [output_tensor, input_tensor[-1]]
     if unwrap_output_tensor:
-        return output_tensor
-    return [output_tensor]
+        return output_tensor, bal_loss
+    return [output_tensor, bal_loss]
 
 
-def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
+def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, bal_loss):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -185,7 +195,7 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
     # Backward pass.
     if output_tensor_grad[0] is None:
         output_tensor = optimizer.scale_loss(output_tensor[0])
-    custom_backward(output_tensor[0], output_tensor_grad[0])
+    custom_backward(output_tensor[0], output_tensor_grad[0], bal_loss)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -241,20 +251,20 @@ def forward_backward_no_pipelining(forward_step_func,
     input_tensor, output_tensor_grad = None, None
     with context_handler():
         for i in range(get_num_microbatches() - 1):
-            output_tensor = forward_step(forward_step_func, data_iterator,
+            output_tensor, bal_loss = forward_step(forward_step_func, data_iterator,
                                          model, input_tensor, forward_data_store,
                                          collect_non_loss_data)
             if not forward_only:
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, bal_loss)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
-    output_tensor = forward_step(forward_step_func, data_iterator,
+    output_tensor, bal_loss = forward_step(forward_step_func, data_iterator,
                                  model, input_tensor, forward_data_store,
                                  collect_non_loss_data)
     if not forward_only:
-        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad)
+        backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, bal_loss)
 
     return forward_data_store
 
@@ -269,6 +279,8 @@ def forward_backward_pipelining_with_interleaving(forward_step_func,
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    # FastMoE TODO
+    assert False, "FastMoE not supports pipeline with interleaving"
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     forward_data_store = []
@@ -646,15 +658,17 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
+    bal_losses = None
     if not forward_only:
         input_tensors = []
         output_tensors = []
+        bal_losses = []
     forward_data_store = []
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
-        output_tensor = forward_step(forward_step_func, data_iterator, model,
+        output_tensor, bal_loss = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, forward_data_store,
                                      collect_non_loss_data)
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
@@ -662,6 +676,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
+            bal_losses.append(bal_loss)
             deallocate_output_tensor(output_tensor[0])
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -674,7 +689,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
     for i in range(num_microbatches_remaining):
         last_iteration = (i == (num_microbatches_remaining - 1))
 
-        output_tensor = forward_step(forward_step_func, data_iterator, model,
+        output_tensor, bal_loss = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, forward_data_store,
                                      collect_non_loss_data)
         if forward_only:
@@ -692,16 +707,18 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
+            bal_losses.append(bal_loss)
             deallocate_output_tensor(output_tensor[0])
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
+            bal_loss = bal_loss.pop(0)
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, bal_loss)
 
             if last_iteration:
                 input_tensor = None
@@ -716,12 +733,13 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
         for i in range(num_warmup_microbatches):
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
+            bal_loss = bal_losses.pop(0)
 
             output_tensor_grad = recv_backward(send_tensor_shapes, timers=timers)
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, bal_loss)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 

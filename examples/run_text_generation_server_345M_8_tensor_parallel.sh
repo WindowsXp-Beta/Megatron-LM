@@ -1,19 +1,19 @@
 #!/bin/bash
 # This example will start serving the 345M model that is partitioned 8 way tensor parallel
-DISTRIBUTED_ARGS="--nproc_per_node 8 \
+DISTRIBUTED_ARGS="--nproc_per_node 4 \
                   --nnodes 1 \
                   --node_rank 0 \
                   --master_addr localhost \
                   --master_port 6000"
 
-CHECKPOINT=<Path to checkpoint (e.g /345m)>
-VOCAB_FILE=<Path to vocab.json (e.g. /gpt2-vocab.json)>
-MERGE_FILE=<Path to merges.txt (e.g. /gpt2-merges.txt)>
+CHECKPOINT=data/megatron_lm_345m_v0.0.zip
+VOCAB_FILE=data/gpt2-vocab.json
+MERGE_FILE=data/gpt2-merges.txt
 
 pip install flask-restful
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
-       --tensor-model-parallel-size 8  \
+       --tensor-model-parallel-size 4  \
        --pipeline-model-parallel-size 1  \
        --num-layers 24  \
        --hidden-size 1024  \
@@ -30,3 +30,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS tools/run_text_generation_s
        --merge-file $MERGE_FILE  \
        --top_p 0.9  \
        --seed 42
+       # --fmoefy

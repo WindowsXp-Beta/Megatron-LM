@@ -23,6 +23,7 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
+from fmoe.megatron.checkpoint import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
