@@ -12,9 +12,10 @@ NNODES=${SLURM_NNODES:-"1"}
 NODE_RANK=${RANK:-"0"}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=$1
-TOKENIZER_MODEL=$2
-DATA_PATH=$3
+CHECKPOINT_PATH=/mnt/nvme/checkpoints/mcore
+TOKENIZER_MODEL=/mnt/nvme/checkpoints/hf/mixtral/tokenizer.model
+DATA_PATH=/root/Megatron-LM/examples/mixtral/data
+DATA_CACHE_PATH=/root/Megatron-LM/examples/mixtral/data/cache
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -65,6 +66,18 @@ DATA_ARGS=(
     --split 99990,8,2
 )
 
+DATA_ARGS_MOCK=(
+    --mock-data
+    --tokenizer-type NullTokenizer
+    --vocab-size 128256
+    --data-cache-path ${DATA_CACHE_PATH}
+    --tiktoken-pattern v2
+    --split '99,1,0'
+    --no-create-attention-mask-in-dataloader
+    --no-mmap-bin-files
+    --num-workers 1
+)
+
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 256
@@ -77,12 +90,13 @@ TRAINING_ARGS=(
     --lr-warmup-iters 500
     --clip-grad 1.0
     --bf16
+    --no-gradient-accumulation-fusion
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 4
-    --expert-model-parallel-size 8
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size 2
+    --expert-model-parallel-size 2
     --use-distributed-optimizer
     --sequence-parallel
 )
@@ -106,11 +120,17 @@ if [ -n "${WANDB_API_KEY}" ]; then
     )
 fi
 
+if [ ! -f verl_run_version.txt ]; then
+    RUN_COUNT=0
+else
+    RUN_COUNT=$(cat verl_run_version.txt)
+fi
+echo $((RUN_COUNT + 1)) > verl_run_version.txt
 
-torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+torchrun ${DISTRIBUTED_ARGS[@]} /root/Megatron-LM/pretrain_gpt.py \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
-    ${DATA_ARGS[@]} \
+    ${DATA_ARGS_MOCK[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
-    ${LOGGING_ARGS[@]}
+    ${LOGGING_ARGS[@]} 2>&1 | tee mixtral_train_${RUN_COUNT}.log
