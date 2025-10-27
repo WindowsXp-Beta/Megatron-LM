@@ -109,6 +109,7 @@ class MoELayer(BaseMoELayer):
         # Initialize process groups with the global parallel_state.
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
+        self.pg_collection = pg_collection
         super(MoELayer, self).__init__(
             config=config, layer_number=layer_number, pg_collection=pg_collection
         )
@@ -225,26 +226,41 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        dispatched_input, tokens_per_expert, permuted_probs = (
+        dispatched_input, tokens_per_expert, permuted_probs, \
+            dense_permuted_local_hidden_states, dense_tokens_per_expert, dense_local_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
-        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        dense_expert_output, dense_mlp_bias = self.experts(
+            dense_permuted_local_hidden_states, dense_tokens_per_expert, dense_local_probs)
+        sparse_mask = self.token_dispatcher.local_map.T.reshape(-1, 1) # [num_local_experts * num_tokens, 1]
+        if dense_expert_output.requires_grad:
+            dense_expert_output.register_hook(lambda grad: grad * sparse_mask)
 
-        return output, mlp_bias
+        assert dense_mlp_bias is None, f"dense_mlp_bias is not supported for {type(self.token_dispatcher)}"
 
-    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+        sparse_expert_output = dense_expert_output[sparse_mask.view(-1)]
+
+        sparse_output = self.token_dispatcher.combine_preprocess(sparse_expert_output)
+        dense_output = self.token_dispatcher.combine_preprocess(dense_expert_output, is_dense=True)
+
+        return sparse_output, dense_output, dense_mlp_bias
+
+    def combine(self, sparse_output: torch.Tensor, dense_output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication). It then adds the output
         from the shared expert if it exists.
         """
-        output = self.token_dispatcher.token_combine(output)
-        output = self.token_dispatcher.combine_postprocess(output)
+        sparse_output = self.token_dispatcher.token_combine(sparse_output)
+        sparse_output = self.token_dispatcher.combine_postprocess(sparse_output)
+
+        dense_output = self.token_dispatcher.token_combine(dense_output)
+        dense_output = self.token_dispatcher.combine_postprocess(dense_output)
+
+        output = sparse_output.detach() + (dense_output - dense_output.detach())
         if shared_expert_output is not None:
-            output = output + shared_expert_output
+            output += shared_expert_output
         return output
 
     def forward(self, hidden_states: torch.Tensor):
@@ -273,8 +289,8 @@ class MoELayer(BaseMoELayer):
             shared_expert_output = self.shared_experts_compute(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
-            output = self.combine(output, shared_expert_output)
+            sparse_output, dense_output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+            output = self.combine(sparse_output, dense_output, shared_expert_output)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

@@ -28,11 +28,11 @@ DISTRIBUTED_ARGS=(
 MODEL_ARGS=(
     --use-mcore-models
     --disable-bias-linear
-    --seq-length 4096
+    --seq-length 1024
     --max-position-embeddings 32768
     --num-layers 32
-    --hidden-size 4096
-    --ffn-hidden-size 14336
+    --hidden-size 1024
+    --ffn-hidden-size 4096
     --num-attention-heads 32
     --init-method-std 0.01
     --attention-dropout 0.0
@@ -54,7 +54,7 @@ MOE_ARGS=(
     --moe-router-load-balancing-type aux_loss
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
-    --moe-token-dispatcher-type alltoall
+    --moe-token-dispatcher-type allgather
     --overlap-param-gather
     --overlap-grad-reduce
 )
@@ -91,6 +91,7 @@ TRAINING_ARGS=(
     --clip-grad 1.0
     --bf16
     --no-gradient-accumulation-fusion
+    --distributed-timeout-minutes 60
 )
 
 MODEL_PARALLEL_ARGS=(

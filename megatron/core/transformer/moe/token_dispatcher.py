@@ -286,13 +286,29 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
         )
 
+        # create a self.dense_local_map whose shape is the same as self.local_map but all the elements are True
+        self.dense_local_map = torch.ones_like(self.local_map, dtype=torch.bool)
+        dense_tokens_per_expert = self.dense_local_map.sum(dim=0).long().cpu()
+
+        (dense_permuted_local_hidden_states, _, self.dense_reversed_local_input_permutation_mapping) = permute(
+            hidden_states,
+            self.dense_local_map,
+            num_out_tokens=dense_tokens_per_expert.sum(),
+            fused=self.config.moe_permute_fusion,
+        )
+
+        self.dense_local_probs = self.local_probs.T.contiguous().masked_select(
+            self.dense_local_map.T.contiguous()
+        )
+
         self.local_probs = self.local_probs.T.contiguous().masked_select(
             self.local_map.T.contiguous()
         )
         self.routing_map = None
-        return permuted_local_hidden_states, tokens_per_expert, self.local_probs
+        return permuted_local_hidden_states, tokens_per_expert, self.local_probs, \
+            dense_permuted_local_hidden_states, dense_tokens_per_expert, self.dense_local_probs
 
-    def combine_preprocess(self, hidden_states):
+    def combine_preprocess(self, hidden_states, is_dense: bool = False):
         """
         Reverses token permutation to restore original ordering before reduction operations.
 
@@ -301,11 +317,17 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         original sequence positions, preparing them for the subsequent reduction scatter
         operation that will aggregate results across ranks.
         """
+        if is_dense:
+            reversed_local_input_permutation_mapping = self.dense_reversed_local_input_permutation_mapping
+            local_map = self.dense_local_map
+        else:
+            reversed_local_input_permutation_mapping = self.reversed_local_input_permutation_mapping
+            local_map = self.local_map
         unpermuted_local_hidden = unpermute(
             hidden_states,
-            self.reversed_local_input_permutation_mapping,
+            reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.local_map,
+            routing_map=local_map,
             fused=self.config.moe_permute_fusion,
         )
         return unpermuted_local_hidden
