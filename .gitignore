@@ -16,3 +16,5 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+examples/mixtral/data/
+examples/mixtral/mixtral_train_*.log
